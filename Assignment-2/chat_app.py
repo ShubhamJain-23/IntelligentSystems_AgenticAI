@@ -99,9 +99,13 @@ def main():
         if "[Error" in bot1_reply:
             break
 
-    # Save the chat version to a JSON file
+    # Save the chat version to a JSON file in the chat_history folder
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"chat_log_{timestamp}.json"
+    history_dir = "chat_history"
+    if not os.path.exists(history_dir):
+        os.makedirs(history_dir)
+        
+    filename = os.path.join(history_dir, f"chat_log_{timestamp}.json")
     with open(filename, "w", encoding="utf-8") as f:
         json.dump(chat_log, f, indent=4)
         
