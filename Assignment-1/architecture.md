@@ -1,30 +1,88 @@
-# Project Architecture: PDF Search Tool
+# Project Architecture: PDF Search & RAG Tool
 
 ## Overview
-The PDF Search Tool is a lightweight, command-line application designed to find the most relevant page in a large PDF document (e.g., 100+ pages) given a user's text query.
-
-## Software Architecture
-The application is structured as a single-script Python program (`pdf_search.py`). The logic is divided into modular functions to separate concerns:
-
-1. **User Interface / I/O Handling:** Handles interactive command-line prompts and input validation (e.g., gracefully handling drag-and-dropped file paths with quotes).
-2. **Document Parsing (`extract_text_from_pdf`):** Interfaces with the file system and uses the `pypdf` library to parse and extract text from the PDF. It returns a structured list of strings where each index corresponds to a page.
-3. **Core Search Engine (`search_pdf`):** Takes the extracted text and the user's query, transforms both into a shared vector space, computes mathematical similarities, and returns the highest-scoring page with a contextual snippet.
+The PDF Search & RAG Tool is a command-line application that bridges document understanding with generative AI. It allows users to ask natural language questions against large PDF documents and receive grounded, accurate answers backed by cited page excerpts.
 
 ---
 
-## Technical Architecture (The Search Engine)
+## Architectural Evolution
 
-The core technical architecture has evolved during the development of this assignment to better handle natural language questions. 
+```mermaid
+flowchart LR
+    A["Stage 1: Lexical Search (TF-IDF)"] --> B["Stage 2: Dense Semantic Search"]
+    B --> C["Stage 3: Retrieval-Augmented Generation (RAG)"]
+```
 
-### Initial Approach: TF-IDF (Lexical Search)
-Initially, the tool was built using **Term Frequency-Inverse Document Frequency (TF-IDF)** and Cosine Similarity via `scikit-learn`.
-* **How it worked:** It vectorized the text based on the statistical frequency of words. It counted the occurrences of words in the query and compared them to the occurrences of those same words on each page.
-* **Why we changed it:** TF-IDF relies entirely on *exact keyword matching*. If a user asked a conceptual question like "What are the risks of database exploits?", TF-IDF would strictly look for the exact words "risks", "database", and "exploits". It would completely fail to find a page discussing "SQL injection vulnerabilities" because it lacks the ability to understand that the concepts are semantically related. This resulted in poor performance for conversational questions.
+### Stage 1: Lexical Search (TF-IDF)
+- **Mechanism:** Text parsed with `pypdf`, vectorized using `scikit-learn`'s `TfidfVectorizer`, and compared via cosine similarity.
+- **Limitation:** Relied strictly on exact keyword matching. Failed on synonymous queries (e.g. searching "risks of database exploits" missed pages discussing "SQL injection").
 
-### Current Approach: Semantic Search (Dense Embeddings)
-To solve the limitations of lexical search, we upgraded the engine to use **Semantic Search** via `sentence-transformers` and PyTorch (`torch`).
-* **How it works:** 
-  1. **Vector Embeddings:** We use a pre-trained Large Language Model (LLM) tailored for embeddings to encode both the user's query and the text of each PDF page into high-dimensional dense vectors.
-  2. **Cosine Similarity:** We calculate the cosine similarity between the query vector and all page vectors to find the closest point in the semantic space.
-* **Why we did this:** Transformer models understand the *meaning* and *context* of language. By converting text into semantic vectors, the system can map a question to an answer even if they share zero exact keywords. 
-* **Model Selection:** The `all-MiniLM-L6-v2` model was chosen specifically because it offers a perfect balance for this use case: it provides excellent semantic similarity mapping while being highly optimized, fast, and having a very small memory footprint (~80MB), making it ideal for a local command-line tool.
+### Stage 2: Dense Semantic Search (Sentence Transformers)
+- **Mechanism:** Leveraged `sentence-transformers/all-MiniLM-L6-v2` to map queries and document pages into a shared 384-dimensional dense semantic vector space.
+- **Improvement:** Understood meaning, synonyms, and conversational formulations.
+- **Limitation:** Only returned raw text chunks and numerical scores. The user still had to read through the retrieved excerpt to synthesize the answer.
+
+### Stage 3: Retrieval-Augmented Generation (RAG) — Current Architecture
+- **Mechanism:** Combines dense semantic retrieval with an LLM generation pipeline:
+  1. Retrieves top-$k$ relevant chunks from the PDF.
+  2. Augments the user's query with the retrieved chunks into an explicit prompt.
+  3. Sends the augmented prompt to an LLM (local server via LM Studio / Ollama, or OpenAI API).
+  4. Outputs both the **augmented prompt** and the **synthesized answer**.
+- **Advantage:** Delivers direct, conversational, grounded answers with citations and zero hallucination.
+
+---
+
+## Software Architecture & Modular Design
+
+```mermaid
+flowchart TD
+    PDF["Input PDF Document"] --> Extract["extract_chunks_from_pdf()"]
+    Extract --> Sanitize["Unicode Sanitizer & Chunk Splitter"]
+    Sanitize --> Chunks["Document Context Chunks (with Page IDs)"]
+
+    Query["User Query"] --> Embedder["retrieve_relevant_chunks()"]
+    Chunks --> Embedder
+    STModel["SentenceTransformer (all-MiniLM-L6-v2)"] --> Embedder
+    Embedder --> TopK["Top-k Most Relevant Chunks"]
+
+    TopK --> Augment["build_augmented_prompt(query, chunks)"]
+    Query --> Augment
+    Augment --> Prompt["Augmented Prompt (Context + Instructions + Query)"]
+
+    Prompt --> Generator["generate_llm_response()"]
+    LLM["LLM (LM Studio / OpenAI Server)"] <--> Generator
+    Generator --> Response["Generated Answer"]
+
+    Prompt --> OutputCLI["Console Output Display"]
+    Response --> OutputCLI
+```
+
+### Core Components in `pdf_search.py`:
+
+1. **`extract_chunks_from_pdf(pdf_path, max_chunk_chars, overlap)`:**
+   - Parses pages using `pypdf.PdfReader`.
+   - Cleans whitespace and strips unpaired UTF-16 surrogates (`encode('utf-8', 'ignore')`).
+   - Slices pages exceeding `max_chunk_chars` into overlapping segments to prevent information loss at chunk boundaries.
+   - Attaches `chunk_id` and `page` metadata to every chunk.
+
+2. **`retrieve_relevant_chunks(chunks, query, top_k, model_name)`:**
+   - Loads `all-MiniLM-L6-v2`.
+   - Encodes query and all document chunks into PyTorch tensors.
+   - Computes cosine similarity scores via `util.cos_sim`.
+   - Returns the top-$k$ most relevant chunks ranked by similarity.
+
+3. **`build_augmented_prompt(query, chunks)`:**
+   - Constructs a standardized prompt template containing:
+     - Clear persona instructions (rely strictly on provided context, no hallucinations).
+     - Formatted context chunks labeled with originating page numbers.
+     - The user's query question.
+
+4. **`generate_llm_response(augmented_prompt, base_url, api_key, model_name, mock, chunks)`:**
+   - Initializes an `openai.OpenAI` client pointing to the target base URL (default: `http://localhost:1234/v1`).
+   - Issues a chat completion request with low temperature (0.3) for factual precision.
+   - Gracefully handles server unavailability by catching connection errors and printing clear diagnostic steps.
+   - Provides `--mock` support for offline testing.
+
+5. **`rag_search(...)` & `main()`:**
+   - Orchestrates the full pipeline.
+   - Supports both interactive CLI prompts and non-interactive command-line arguments (`argparse`).
